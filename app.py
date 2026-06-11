@@ -7,7 +7,6 @@ import time
 
 import telebot
 from flask import Flask, abort, request
-from telebot import formatting
 from telebot.types import InputMediaPhoto, InputMediaVideo, Update
 from telebot.types import MessageEntity
 
@@ -33,17 +32,26 @@ EMOJI_RE = re.compile(
     "\U0001F300-\U0001F5FF"
     "\U0001F680-\U0001F6FF"
     "\U0001F1E0-\U0001F1FF"
+    "\U0001F700-\U0001FAFF"
     "\U00002700-\U000027BF"
     "\U000024C2-\U0001F251"
+    "\U0000FE0F"
     "]+",
     flags=re.UNICODE,
 )
 
 EMOJI_REPLACEMENTS = {
+    "🔴": "- ",
+    "🟠": "- ",
     "🟢": "- ",
     "🟡": "- ",
-    "🔴": "- ",
     "🔵": "- ",
+    "🟣": "- ",
+    "⚫": "- ",
+    "⚫️": "- ",
+    "⚪": "- ",
+    "⚪️": "- ",
+    "🟤": "- ",
 }
 
 FORBIDDEN_PHRASES = (
@@ -140,22 +148,32 @@ def transform_line(line: str, is_first: bool):
     index = 0
 
     while index < len(line):
-        char = line[index]
-        char_len = utf16_len(char)
-        replacement = EMOJI_REPLACEMENTS.get(char)
+        old_text = line[index]
+        replacement = None
+
+        for emoji, repl in sorted(EMOJI_REPLACEMENTS.items(), key=lambda item: len(item[0]), reverse=True):
+            if line.startswith(emoji, index):
+                old_text = emoji
+                replacement = repl
+                break
+
+        char_len = utf16_len(old_text)
 
         if replacement is not None:
             new_text = replacement
-            next_index = index + 1
+            next_index = index + len(old_text)
             while next_index < len(line) and line[next_index].isspace() and line[next_index] != "\n":
                 char_len += utf16_len(line[next_index])
                 next_index += 1
-        elif is_first and EMOJI_RE.fullmatch(char):
+        elif EMOJI_RE.fullmatch(old_text):
             new_text = ""
-            next_index = index + 1
+            next_index = index + len(old_text)
+            while next_index < len(line) and line[next_index].isspace() and line[next_index] != "\n":
+                char_len += utf16_len(line[next_index])
+                next_index += 1
         else:
-            new_text = char
-            next_index = index + 1
+            new_text = old_text
+            next_index = index + len(old_text)
 
         transformed.append(new_text)
         next_old_offset = old_offset + char_len
@@ -206,6 +224,110 @@ def sort_entities(entities):
         unique.append(entity)
 
     return sorted(unique, key=lambda entity: (entity.offset, -entity.length))
+
+
+def utf16_to_py_index_map(text: str):
+    mapping = {}
+    utf_offset = 0
+
+    for index, char in enumerate(text):
+        mapping[utf_offset] = index
+        utf_offset += utf16_len(char)
+
+    mapping[utf_offset] = len(text)
+    return mapping
+
+
+def entity_to_html(entity, inner_html: str) -> str:
+    if entity.type == "bold":
+        return f"<b>{inner_html}</b>"
+    if entity.type == "italic":
+        return f"<i>{inner_html}</i>"
+    if entity.type == "underline":
+        return f"<u>{inner_html}</u>"
+    if entity.type == "strikethrough":
+        return f"<s>{inner_html}</s>"
+    if entity.type == "spoiler":
+        return f"<tg-spoiler>{inner_html}</tg-spoiler>"
+    if entity.type == "code":
+        return f"<code>{inner_html}</code>"
+    if entity.type == "pre":
+        language = getattr(entity, "language", None)
+        if language:
+            return f'<pre><code class="language-{html.escape(language, quote=True)}">{inner_html}</code></pre>'
+        return f"<pre>{inner_html}</pre>"
+    if entity.type == "blockquote":
+        return f"<blockquote>{inner_html}</blockquote>"
+    if entity.type == "expandable_blockquote":
+        return f"<blockquote expandable>{inner_html}</blockquote>"
+    if entity.type == "text_link":
+        url = html.escape(getattr(entity, "url", "") or "", quote=True)
+        return f'<a href="{url}">{inner_html}</a>'
+    if entity.type == "text_mention":
+        user = getattr(entity, "user", None)
+        if user and getattr(user, "id", None):
+            return f'<a href="tg://user?id={user.id}">{inner_html}</a>'
+    if entity.type == "custom_emoji":
+        emoji_id = html.escape(getattr(entity, "custom_emoji_id", "") or "", quote=True)
+        return f'<tg-emoji emoji-id="{emoji_id}">{inner_html}</tg-emoji>'
+
+    return inner_html
+
+
+def render_html(text: str, entities=None) -> str:
+    if not entities:
+        return html.escape(text)
+
+    index_map = utf16_to_py_index_map(text)
+    nodes = []
+
+    for entity in sort_entities(entities):
+        start = index_map.get(entity.offset)
+        end = index_map.get(entity.offset + entity.length)
+
+        if start is None or end is None or start >= end:
+            continue
+
+        nodes.append(
+            {
+                "entity": entity,
+                "start": start,
+                "end": end,
+                "children": [],
+            }
+        )
+
+    roots = []
+    stack = []
+
+    for node in sorted(nodes, key=lambda item: (item["start"], -item["end"])):
+        while stack and node["start"] >= stack[-1]["end"]:
+            stack.pop()
+
+        if stack and node["end"] <= stack[-1]["end"]:
+            stack[-1]["children"].append(node)
+        else:
+            roots.append(node)
+
+        stack.append(node)
+
+    def render_range(start, end, children):
+        output = []
+        cursor = start
+
+        for child in sorted(children, key=lambda item: (item["start"], item["end"])):
+            if child["start"] < cursor:
+                continue
+
+            output.append(html.escape(text[cursor:child["start"]]))
+            inner_html = render_range(child["start"], child["end"], child["children"])
+            output.append(entity_to_html(child["entity"], inner_html))
+            cursor = child["end"]
+
+        output.append(html.escape(text[cursor:end]))
+        return "".join(output)
+
+    return render_range(0, len(text), roots)
 
 
 def edit_caption(caption: str, entities=None):
@@ -293,28 +415,42 @@ def edit_caption(caption: str, entities=None):
 
 def edit_caption_html(original_caption_html: str) -> str:
     text, entities = html_to_text_and_entities(original_caption_html)
-    return formatting.apply_html_entities(*edit_caption(text, entities), custom_subs=None)
+    return render_html(*edit_caption(text, entities))
+
+
+def edit_message_caption_html(message) -> str:
+    entities = getattr(message, "caption_entities", None)
+    if entities:
+        text, new_entities = edit_caption(message.caption, entities)
+        return render_html(text, new_entities)
+
+    html_caption = getattr(message, "html_caption", None)
+    if html_caption:
+        return edit_caption_html(html_caption)
+
+    text, new_entities = edit_caption(message.caption, None)
+    return render_html(text, new_entities)
 
 
 def process_single_media(message):
     if not message.caption:
         return
 
-    new_caption, new_entities = edit_caption(message.caption, message.caption_entities)
+    new_caption = edit_message_caption_html(message)
 
     if message.content_type == "photo":
         bot.send_photo(
             message.chat.id,
             message.photo[-1].file_id,
             caption=new_caption,
-            caption_entities=new_entities,
+            parse_mode="HTML",
         )
     elif message.content_type == "video":
         bot.send_video(
             message.chat.id,
             message.video.file_id,
             caption=new_caption,
-            caption_entities=new_entities,
+            parse_mode="HTML",
         )
 
 
@@ -331,7 +467,7 @@ def process_media_group(group_id):
     if not first:
         return
 
-    new_caption, new_entities = edit_caption(first.caption, first.caption_entities)
+    new_caption = edit_message_caption_html(first)
     media = []
 
     for message in messages:
@@ -344,7 +480,7 @@ def process_media_group(group_id):
 
         if message.message_id == first.message_id:
             item.caption = new_caption
-            item.caption_entities = new_entities
+            item.parse_mode = "HTML"
 
         media.append(item)
 
