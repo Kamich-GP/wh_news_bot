@@ -8,7 +8,7 @@ Webhook version of the Telegram bot for Render free web services.
 - Rewrites the first caption line in bold and adds a period if needed.
 - Removes lines containing `Game InQisitor` or `Game InQsitor`.
 - Replaces list marker emojis with `- `.
-- Appends the final line.
+- Replaces the original final line with the configured final HTML line.
 - Preserves Telegram formatting from captions by using `message.html_caption`.
 
 ## Deploy on Render

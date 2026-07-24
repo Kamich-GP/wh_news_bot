@@ -362,6 +362,11 @@ def edit_caption(caption: str, entities=None):
         final_text, final_entities = html_to_text_and_entities(FINAL_LINE)
         return final_text, final_entities
 
+    # Replace the original last line with FINAL_LINE. If the original last line
+    # was already removed by the forbidden phrase filter, keep the remaining text.
+    if len(kept_lines) > 1 and kept_lines[-1]["start"] == line_infos[-1]["start"]:
+        kept_lines = kept_lines[:-1]
+
     new_lines = []
     new_entities = []
     line_mappings = []
