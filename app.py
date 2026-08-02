@@ -21,6 +21,7 @@ FINAL_LINE = os.environ.get(
 )
 MEDIA_TIMEOUT = float(os.environ.get("MEDIA_TIMEOUT", "0.9"))
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-1003371396924"))
+GP_CHANNEL_ID = int(os.environ.get("GP_CHANNEL_ID", "-1001262467981"))
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML", threaded=False)
 app = Flask(__name__)
@@ -63,6 +64,18 @@ FORBIDDEN_PHRASES = (
 )
 
 SEND_TO_CHANNEL_PREFIX = "send_channel:"
+SEND_TARGETS = {
+    "main": {
+        "button_text": "Отправить в канал",
+        "success_text": "Отправлено в канал.",
+        "channel_id": CHANNEL_ID,
+    },
+    "gp": {
+        "button_text": "Отправить в GP",
+        "success_text": "Отправлено в GP.",
+        "channel_id": GP_CHANNEL_ID,
+    },
+}
 
 
 def utf16_len(text: str) -> int:
@@ -444,12 +457,15 @@ def edit_message_caption_html(message) -> str:
 
 def make_send_markup(draft_id):
     markup = InlineKeyboardMarkup()
-    markup.add(
-        InlineKeyboardButton(
-            "Отправить в канал",
-            callback_data=f"{SEND_TO_CHANNEL_PREFIX}{draft_id}",
+
+    for target_key, target in SEND_TARGETS.items():
+        markup.add(
+            InlineKeyboardButton(
+                target["button_text"],
+                callback_data=f"{SEND_TO_CHANNEL_PREFIX}{target_key}:{draft_id}",
+            )
         )
-    )
+
     return markup
 
 
@@ -460,7 +476,7 @@ def save_pending_post(items):
         pending_posts[draft_id] = {
             "items": items,
             "created_at": time.time(),
-            "sent": False,
+            "sent_targets": set(),
         }
 
     return draft_id
@@ -518,9 +534,9 @@ def build_media_item(item, with_caption=False):
     return None
 
 
-def send_post_to_channel(items):
+def send_post_to_channel(items, channel_id):
     if len(items) == 1:
-        return send_single_item(CHANNEL_ID, items[0])
+        return send_single_item(channel_id, items[0])
 
     media = []
     for index, item in enumerate(items):
@@ -529,7 +545,7 @@ def send_post_to_channel(items):
             media.append(media_item)
 
     if media:
-        return bot.send_media_group(CHANNEL_ID, media)
+        return bot.send_media_group(channel_id, media)
 
     return None
 
@@ -637,7 +653,18 @@ def handle_media(message):
 
 @bot.callback_query_handler(func=lambda call: call.data and call.data.startswith(SEND_TO_CHANNEL_PREFIX))
 def handle_send_to_channel(call):
-    draft_id = call.data[len(SEND_TO_CHANNEL_PREFIX):]
+    payload = call.data[len(SEND_TO_CHANNEL_PREFIX):]
+
+    try:
+        target_key, draft_id = payload.split(":", 1)
+    except ValueError:
+        bot.answer_callback_query(call.id, "Некорректная кнопка.", show_alert=True)
+        return
+
+    target = SEND_TARGETS.get(target_key)
+    if not target:
+        bot.answer_callback_query(call.id, "Неизвестный канал.", show_alert=True)
+        return
 
     with lock:
         draft = pending_posts.get(draft_id)
@@ -646,31 +673,35 @@ def handle_send_to_channel(call):
             bot.answer_callback_query(call.id, "Черновик не найден или сервер перезапускался.", show_alert=True)
             return
 
-        if draft["sent"]:
-            bot.answer_callback_query(call.id, "Этот пост уже отправлен.", show_alert=True)
+        if target_key in draft["sent_targets"]:
+            bot.answer_callback_query(call.id, "Этот пост уже отправлен сюда.", show_alert=True)
             return
 
-        draft["sent"] = True
+        draft["sent_targets"].add(target_key)
 
     try:
-        send_post_to_channel(draft["items"])
+        send_post_to_channel(draft["items"], target["channel_id"])
     except Exception as error:
         with lock:
-            draft["sent"] = False
+            draft["sent_targets"].discard(target_key)
 
         bot.answer_callback_query(call.id, f"Не удалось отправить: {error}", show_alert=True)
         return
 
-    bot.answer_callback_query(call.id, "Отправлено в канал.")
+    bot.answer_callback_query(call.id, target["success_text"])
 
-    try:
-        bot.edit_message_reply_markup(
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=None,
-        )
-    except Exception:
-        pass
+    with lock:
+        all_sent = all(key in draft["sent_targets"] for key in SEND_TARGETS)
+
+    if all_sent:
+        try:
+            bot.edit_message_reply_markup(
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
 
 
 @app.get("/")

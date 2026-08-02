@@ -10,7 +10,7 @@ Webhook version of the Telegram bot for Render free web services.
 - Replaces list marker emojis with `- `.
 - Replaces the original final line with the configured final HTML line.
 - Preserves Telegram formatting from captions by using `message.html_caption`.
-- Adds an inline button that sends the edited post to the configured channel.
+- Adds inline buttons that send the edited post to the configured channels.
 
 ## Deploy on Render
 
@@ -25,6 +25,7 @@ Webhook version of the Telegram bot for Render free web services.
    - `FINAL_LINE`: optional final HTML line.
    - `MEDIA_TIMEOUT`: optional media group wait time, default `0.9`.
    - `CHANNEL_ID`: target channel ID for the inline send button.
+   - `GP_CHANNEL_ID`: target GP channel ID for the second inline send button.
 
 5. Deploy. On startup, the app registers the Telegram webhook automatically.
 
@@ -38,6 +39,7 @@ export BOT_TOKEN="1234567890:replace_me"
 export WEBHOOK_URL="https://your-public-url.example"
 export WEBHOOK_SECRET="replace_with_a_long_random_string"
 export CHANNEL_ID="-1003371396924"
+export GP_CHANNEL_ID="-1001262467981"
 python app.py
 ```
 
@@ -47,4 +49,4 @@ For local testing with Telegram webhooks, `WEBHOOK_URL` must be a public HTTPS U
 
 The bot token should never be committed to code. If you pasted a real token into chat or a public place, revoke it in BotFather and create a new one.
 
-The bot must be an admin in the target channel and needs permission to post messages.
+The bot must be an admin in the target channels and needs permission to post messages.
