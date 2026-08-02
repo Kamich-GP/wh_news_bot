@@ -4,11 +4,12 @@ import os
 import re
 import threading
 import time
+import uuid
 
 import telebot
 from flask import Flask, abort, request
 from telebot.types import InputMediaPhoto, InputMediaVideo, Update
-from telebot.types import MessageEntity
+from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
 
 
 TOKEN = os.environ["BOT_TOKEN"]
@@ -19,11 +20,13 @@ FINAL_LINE = os.environ.get(
     '<a href="https://t.me/gameplusbackstage">GP Backstage</a> | #новости',
 )
 MEDIA_TIMEOUT = float(os.environ.get("MEDIA_TIMEOUT", "0.9"))
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-1003371396924"))
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML", threaded=False)
 app = Flask(__name__)
 
 media_groups = {}
+pending_posts = {}
 lock = threading.Lock()
 
 EMOJI_RE = re.compile(
@@ -58,6 +61,8 @@ FORBIDDEN_PHRASES = (
     "Game InQisitor",
     "Game InQsitor",
 )
+
+SEND_TO_CHANNEL_PREFIX = "send_channel:"
 
 
 def utf16_len(text: str) -> int:
@@ -437,26 +442,110 @@ def edit_message_caption_html(message) -> str:
     return render_html(text, new_entities)
 
 
+def make_send_markup(draft_id):
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton(
+            "Отправить в канал",
+            callback_data=f"{SEND_TO_CHANNEL_PREFIX}{draft_id}",
+        )
+    )
+    return markup
+
+
+def save_pending_post(items):
+    draft_id = uuid.uuid4().hex[:16]
+
+    with lock:
+        pending_posts[draft_id] = {
+            "items": items,
+            "created_at": time.time(),
+            "sent": False,
+        }
+
+    return draft_id
+
+
+def build_single_item(message, caption):
+    if message.content_type == "photo":
+        return {
+            "type": "photo",
+            "file_id": message.photo[-1].file_id,
+            "caption": caption,
+        }
+
+    if message.content_type == "video":
+        return {
+            "type": "video",
+            "file_id": message.video.file_id,
+            "caption": caption,
+        }
+
+    return None
+
+
+def send_single_item(chat_id, item, reply_markup=None):
+    if item["type"] == "photo":
+        return bot.send_photo(
+            chat_id,
+            item["file_id"],
+            caption=item.get("caption"),
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+
+    if item["type"] == "video":
+        return bot.send_video(
+            chat_id,
+            item["file_id"],
+            caption=item.get("caption"),
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+
+    return None
+
+
+def build_media_item(item, with_caption=False):
+    caption = item.get("caption") if with_caption else None
+
+    if item["type"] == "photo":
+        return InputMediaPhoto(item["file_id"], caption=caption, parse_mode="HTML")
+
+    if item["type"] == "video":
+        return InputMediaVideo(item["file_id"], caption=caption, parse_mode="HTML")
+
+    return None
+
+
+def send_post_to_channel(items):
+    if len(items) == 1:
+        return send_single_item(CHANNEL_ID, items[0])
+
+    media = []
+    for index, item in enumerate(items):
+        media_item = build_media_item(item, with_caption=index == 0)
+        if media_item:
+            media.append(media_item)
+
+    if media:
+        return bot.send_media_group(CHANNEL_ID, media)
+
+    return None
+
+
 def process_single_media(message):
     if not message.caption:
         return
 
     new_caption = edit_message_caption_html(message)
+    item = build_single_item(message, new_caption)
 
-    if message.content_type == "photo":
-        bot.send_photo(
-            message.chat.id,
-            message.photo[-1].file_id,
-            caption=new_caption,
-            parse_mode="HTML",
-        )
-    elif message.content_type == "video":
-        bot.send_video(
-            message.chat.id,
-            message.video.file_id,
-            caption=new_caption,
-            parse_mode="HTML",
-        )
+    if not item:
+        return
+
+    draft_id = save_pending_post([item])
+    send_single_item(message.chat.id, item, reply_markup=make_send_markup(draft_id))
 
 
 def process_media_group(group_id):
@@ -473,24 +562,41 @@ def process_media_group(group_id):
         return
 
     new_caption = edit_message_caption_html(first)
-    media = []
+    items = []
 
     for message in messages:
         if message.content_type == "photo":
-            item = InputMediaPhoto(message.photo[-1].file_id)
+            item = {
+                "type": "photo",
+                "file_id": message.photo[-1].file_id,
+                "caption": None,
+            }
         elif message.content_type == "video":
-            item = InputMediaVideo(message.video.file_id)
+            item = {
+                "type": "video",
+                "file_id": message.video.file_id,
+                "caption": None,
+            }
         else:
             continue
 
-        if message.message_id == first.message_id:
-            item.caption = new_caption
-            item.parse_mode = "HTML"
+        items.append(item)
 
-        media.append(item)
+    if items:
+        items[0]["caption"] = new_caption
+        draft_id = save_pending_post(items)
+        media = []
+        for index, item in enumerate(items):
+            media_item = build_media_item(item, with_caption=index == 0)
+            if media_item:
+                media.append(media_item)
 
-    if media:
         bot.send_media_group(group["chat_id"], media)
+        bot.send_message(
+            group["chat_id"],
+            "Пост готов к отправке в канал.",
+            reply_markup=make_send_markup(draft_id),
+        )
 
 
 def schedule_media_group_processing(group_id):
@@ -527,6 +633,44 @@ def handle_media(message):
         media_groups[group_id]["last_update"] = time.time()
 
     schedule_media_group_processing(group_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith(SEND_TO_CHANNEL_PREFIX))
+def handle_send_to_channel(call):
+    draft_id = call.data[len(SEND_TO_CHANNEL_PREFIX):]
+
+    with lock:
+        draft = pending_posts.get(draft_id)
+
+        if not draft:
+            bot.answer_callback_query(call.id, "Черновик не найден или сервер перезапускался.", show_alert=True)
+            return
+
+        if draft["sent"]:
+            bot.answer_callback_query(call.id, "Этот пост уже отправлен.", show_alert=True)
+            return
+
+        draft["sent"] = True
+
+    try:
+        send_post_to_channel(draft["items"])
+    except Exception as error:
+        with lock:
+            draft["sent"] = False
+
+        bot.answer_callback_query(call.id, f"Не удалось отправить: {error}", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id, "Отправлено в канал.")
+
+    try:
+        bot.edit_message_reply_markup(
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=None,
+        )
+    except Exception:
+        pass
 
 
 @app.get("/")
